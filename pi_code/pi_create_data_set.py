@@ -11,6 +11,8 @@ WORDS = ['HELLO', 'NO_SIGN', 'YES']   # all possible classes you want
 NUM_SEQUENCES = 50                    # sequences per class (per run)
 SEQ_LEN = 30                          # frames per sequence (will sync to existing DS if appending)
 
+FRAME_SIZE = (800, 800)
+
 DATA_PATH = 'sequences_hand_relative_to_nose_polar.pickle'
 
 mp_holistic = mp.solutions.holistic
@@ -25,7 +27,7 @@ mp_drawing = mp.solutions.drawing_utils
 # === Picamera2 setup ===
 picam2 = Picamera2()
 preview_config = picam2.create_preview_configuration(
-    main={"format": "RGB888", "size": (640, 480)}
+    main={"format": "RGB888", "size": FRAME_SIZE}
 )
 picam2.configure(preview_config)
 picam2.start()

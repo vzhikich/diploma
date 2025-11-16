@@ -6,7 +6,7 @@ import time
 import os
 
 # === CONFIG ===
-WORDS = ['HELLO', 'NO_SIGN', 'YES']   # put all words you *might* want
+WORDS = ['HELLO', 'NO_SIGN', 'YES', 'NO']   # put all words you *might* want
 NUM_SEQUENCES = 50                    # sequences per class (per run)
 SEQ_LEN = 30                          # frames per sequence (will sync with existing dataset if appending)
 

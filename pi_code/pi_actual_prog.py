@@ -1,5 +1,4 @@
 from collections import deque
-import cv2
 import mediapipe as mp
 import numpy as np
 from keras.models import load_model
@@ -23,29 +22,32 @@ print(f"Model expects sequences of length {MODEL_SEQ_LEN} with {MODEL_FEATURES} 
 mp_holistic = mp.solutions.holistic
 holistic = mp_holistic.Holistic(
     static_image_mode=False,
+    model_complexity=0,              # faster model on Pi
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
 
-mp_drawing = mp.solutions.drawing_utils
-
 # === PICAMERA2 SETUP ===
 picam2 = Picamera2()
+FRAME_SIZE = (640, 480)  # you can try (960, 540) / (1280, 720) if it's fast enough
 preview_config = picam2.create_preview_configuration(
-    main={"format": "RGB888", "size": (640, 480)}
+    main={"format": "RGB888", "size": FRAME_SIZE}
 )
 picam2.configure(preview_config)
 picam2.start()
 
-# Sliding buffer
+# Sliding buffer of features
 buffer = deque(maxlen=MODEL_SEQ_LEN)
 
+# Last printed prediction to avoid spamming the console
+last_printed = None
 
-def extract_hand_features_relative_to_nose(results, frame_bgr):
+
+def extract_hand_features_relative_to_nose(results):
     """
-    Same features as dataset:
+    Same features as in dataset:
         dx, dy, r, angle for each right-hand landmark relative to nose.
-    Draws nose on frame.
+    Returns list[float] of length MODEL_FEATURES or None.
     """
     if not results.pose_landmarks or not results.right_hand_landmarks:
         return None
@@ -56,11 +58,6 @@ def extract_hand_features_relative_to_nose(results, frame_bgr):
     nose = pose_lm[mp_holistic.PoseLandmark.NOSE]
     nose_x, nose_y = nose.x, nose.y
 
-    h, w, _ = frame_bgr.shape
-    nose_px = int(nose_x * w)
-    nose_py = int(nose_y * h)
-    cv2.circle(frame_bgr, (nose_px, nose_py), 5, (0, 0, 255), -1)
-
     features = []
     for lm in hand_lm:
         dx = lm.x - nose_x
@@ -69,59 +66,55 @@ def extract_hand_features_relative_to_nose(results, frame_bgr):
         angle = np.arctan2(dy, dx)
         features.extend([dx, dy, r, angle])
 
-    return features  # length 84
+    if len(features) != MODEL_FEATURES:
+        # Should not happen if training & feature logic match
+        return None
+
+    return features
 
 
-while True:
-    # Default prediction for this frame
-    display_text = "NO"
+try:
+    print("Starting sign recognition. Press Ctrl+C to stop.")
+    while True:
+        # Get frame from picamera2 (RGB)
+        frame_rgb = picam2.capture_array()
 
-    # Get frame from picamera2 (RGB), convert to BGR for OpenCV display
-    frame_rgb = picam2.capture_array()
-    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        # Mediapipe expects RGB
+        results = holistic.process(frame_rgb)
 
-    img_rgb = frame_rgb  # Mediapipe expects RGB
-    results = holistic.process(img_rgb)
+        # Extract features for this frame
+        features = extract_hand_features_relative_to_nose(results)
 
-    features = extract_hand_features_relative_to_nose(results, frame_bgr)
-
-    if features is not None:
-        if len(features) != MODEL_FEATURES:
-            print(f"Feature size mismatch: got {len(features)}, expected {MODEL_FEATURES}")
-        else:
+        if features is not None:
             buffer.append(features)
-
-        # Optional: draw right-hand landmarks
-        if results.right_hand_landmarks:
-            mp_drawing.draw_landmarks(
-                frame_bgr,
-                results.right_hand_landmarks,
-                mp_holistic.HAND_CONNECTIONS
-            )
-    else:
-        # Lost hand/pose → clear sequence
-        buffer.clear()
-
-    # Predict when we have a full sequence
-    if len(buffer) == MODEL_SEQ_LEN:
-        x_input = np.asarray(buffer, dtype=np.float32).reshape(1, MODEL_SEQ_LEN, MODEL_FEATURES)
-        probs = model.predict(x_input, verbose=0)[0]
-        idx = np.argmax(probs)
-        max_prob = probs[idx]
-        class_name = label_encoder.inverse_transform([idx])[0]
-
-        # Only show sign if confident and not NO_SIGN
-        if max_prob >= THRESHOLD and class_name != 'NO_SIGN':
-            display_text = class_name
         else:
-            display_text = "NO"
+            # Lost hand/pose → clear sequence
+            buffer.clear()
 
-    cv2.putText(frame_bgr, display_text, (10, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        current_prediction = "NO_SIGH"
 
-    cv2.imshow('Sign word recognition (Picamera2)', frame_bgr)
-    if cv2.waitKey(1) & 0xFF == 27:  # ESC
-        break
+        # When buffer is full, run prediction
+        if len(buffer) == MODEL_SEQ_LEN:
+            x_input = np.asarray(buffer, dtype=np.float32).reshape(1, MODEL_SEQ_LEN, MODEL_FEATURES)
+            probs = model.predict(x_input, verbose=0)[0]
+            idx = np.argmax(probs)
+            max_prob = probs[idx]
+            class_name = label_encoder.inverse_transform([idx])[0]
 
-picam2.stop()
-cv2.destroyAllWindows()
+            # Only count as sign if confident and not NO_SIGN
+            if max_prob >= THRESHOLD and class_name != 'NO_SIGN':
+                current_prediction = class_name
+            else:
+                current_prediction = "NO_SIGH"
+
+        # Print only when prediction changes
+        if current_prediction != last_printed:
+            print("Prediction:", current_prediction)
+            last_printed = current_prediction
+
+except KeyboardInterrupt:
+    print("\nStopping...")
+
+finally:
+    picam2.stop()
+    holistic.close()
