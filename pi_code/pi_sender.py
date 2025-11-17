@@ -13,7 +13,7 @@ THRESHOLD = 0.7
 MODEL_PATH = "lstm_hand_relative_to_nose_polar.h5"
 LABEL_PATH = "label_encoder_words.pkl"
 
-SERVER_HOST = "192.168.1.100"   # <-- PUT YOUR PC's LAN IP HERE
+SERVER_HOST = "192.168.0.102"   # <-- PUT YOUR PC's LAN IP HERE
 SERVER_PORT = 5005              # must match sign_receiver.py
 RECONNECT_DELAY = 5.0           # seconds
 
