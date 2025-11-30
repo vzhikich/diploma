@@ -1,6 +1,6 @@
 import socket
 
-HOST = "your.pi.hostname.or.ip"   # e.g. "raspberrypi.local" or public DNS/IP
+HOST = "172.20.10.5"   # e.g. "raspberrypi.local" or public DNS/IP
 PORT = 5005                       # must match SERVER_PORT on Pi
 
 def main():
