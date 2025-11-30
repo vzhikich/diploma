@@ -1,86 +1,150 @@
-# test_fps_with_model.py
+# measure_fps_with_model_real_pipeline.py
+
 from collections import deque
 from picamera2 import Picamera2
 import cv2
 import time
 import numpy as np
 from keras.models import load_model
+import mediapipe as mp
+import math
 
-# === НАЛАШТУВАННЯ ===
+# ==== CONFIG ====
+MODEL_PATH = "lstm_hand_relative_to_nose_polar.h5"
 
-# Список роздільностей, які хочеш перевірити
+# List of resolutions to test
 RESOLUTIONS = [
     (640, 480),
     (960, 540),
     (1280, 720),
-    # додай свої варіанти
+    # add more if you want
 ]
 
-TEST_DURATION = 5.0  # скільки секунд міряти FPS для кожної роздільної здатності
+TEST_DURATION = 10.0  # seconds to measure per resolution
 
-MODEL_PATH = "lstm_hand_relative_to_nose_polar.h5"  # шлях до твоєї моделі
-
-# === ЗАВАНТАЖЕННЯ МОДЕЛІ ===
-print(f"Завантажуємо модель з {MODEL_PATH} ...")
+# ==== LOAD MODEL ====
+print(f"[INFO] Loading model from '{MODEL_PATH}' ...")
 model = load_model(MODEL_PATH)
 
-# input_shape: (None, SEQ_LEN, FEATURES)
-_, SEQ_LEN, FEATURES = model.input_shape
-print(f"Модель очікує послідовності форми: (batch, {SEQ_LEN}, {FEATURES})")
+# Model input shape: (None, seq_len, features)
+_, SEQ_LEN, MODEL_FEATURES = model.input_shape
+print(f"[INFO] Model expects sequences of shape: (batch, {SEQ_LEN}, {MODEL_FEATURES})")
 
-# Буфер для "послідовності ознак"
+# Warm-up prediction (to avoid first-call overhead in timing)
+dummy_seq = np.zeros((1, SEQ_LEN, MODEL_FEATURES), dtype=np.float32)
+_ = model.predict(dummy_seq, verbose=0)
+print("[INFO] Model warm-up prediction done.")
+
+# Sliding buffer for features
 buffer = deque(maxlen=SEQ_LEN)
 
-# === КАМЕРА ===
+# ==== MEDIAPIPE HOLISTIC SETUP ====
+mp_holistic = mp.solutions.holistic
+holistic = mp_holistic.Holistic(
+    static_image_mode=False,
+    model_complexity=0,            # faster on Raspberry Pi
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+# ==== FEATURE EXTRACTION FUNCTION ====
+def extract_hand_features_relative_to_nose(results):
+    """
+    Extract features for one frame:
+      For each right-hand landmark:
+        dx, dy, r, angle relative to the nose.
+    Returns: list[float] or None if pose/right hand not detected.
+    """
+    if not results.pose_landmarks or not results.right_hand_landmarks:
+        return None
+
+    pose_lm = results.pose_landmarks.landmark
+    hand_lm = results.right_hand_landmarks.landmark
+
+    nose = pose_lm[mp_holistic.PoseLandmark.NOSE]
+    nose_x, nose_y = nose.x, nose.y
+
+    features = []
+    for lm in hand_lm:
+        dx = lm.x - nose_x
+        dy = lm.y - nose_y
+        r = math.sqrt(dx * dx + dy * dy)
+        angle = math.atan2(dy, dx)
+        features.extend([dx, dy, r, angle])
+
+    # Safety check: must match model's feature size
+    if len(features) != MODEL_FEATURES:
+        # You can print warning here if you want
+        return None
+
+    return features
+
+
+# ==== CAMERA SETUP ====
 picam2 = Picamera2()
 
-for width, height in RESOLUTIONS:
-    print(f"\n=== Тестуємо {width}x{height} з запуском LSTM на фоні ===")
+results_summary = []
 
+for width, height in RESOLUTIONS:
+    print(f"\n[INFO] Testing resolution {width}x{height} ...")
+
+    # Configure camera for this resolution
     config = picam2.create_preview_configuration(
         main={"size": (width, height), "format": "RGB888"}
     )
     picam2.configure(config)
     picam2.start()
-    time.sleep(1.0)  # короткий прогрів камери
+    time.sleep(1.0)  # small warm-up for camera
 
-    # очистити буфер перед новим тестом
     buffer.clear()
-
     frames = 0
-    t0 = time.time()
+    start_time = time.time()
 
     while True:
-        frame = picam2.capture_array()
+        frame_rgb = picam2.capture_array()  # Picamera2 gives RGB
         frames += 1
 
-        # ---- ІМІТАЦІЯ РОБОТИ LSTM-МОДЕЛІ ----
-        # Створюємо "фейковий" вектор ознак одного кадру
-        # (можна зробити np.random.randn(...) замість нулів — різниці для навантаження майже немає)
-        dummy_features = np.zeros((FEATURES,), dtype=np.float32)
-        buffer.append(dummy_features)
+        # Run MediaPipe on RGB frame
+        results_mp = holistic.process(frame_rgb)
 
-        # Коли буфер заповнений — робимо передбачення
-        if len(buffer) == SEQ_LEN:
-            x_input = np.asarray(buffer, dtype=np.float32).reshape(1, SEQ_LEN, FEATURES)
-            _ = model.predict(x_input, verbose=0)
+        # Extract real features from landmarks
+        feats = extract_hand_features_relative_to_nose(results_mp)
+        if feats is not None:
+            buffer.append(feats)
 
-        # ---- ПРЕВ'Ю (можна вимкнути для чистого вимірювання) ----
-        cv2.imshow("Camera preview", frame)
-        key = cv2.waitKey(1) & 0xFF
-        # ESC → перервати поточний тест раніше
-        if key == 27:
+            # When sequence full -> run real model prediction
+            if len(buffer) == SEQ_LEN:
+                x_input = np.asarray(buffer, dtype=np.float32).reshape(
+                    1, SEQ_LEN, MODEL_FEATURES
+                )
+                _ = model.predict(x_input, verbose=0)
+
+        # Stop condition: TEST_DURATION seconds
+        elapsed = time.time() - start_time
+        if elapsed >= TEST_DURATION:
             break
-
-        # Достатньо кадрів для цього тесту
-        if time.time() - t0 >= TEST_DURATION:
-            break
-
-    elapsed = time.time() - t0
-    fps = frames / elapsed if elapsed > 0 else 0.0
-    print(f"Роздільність {width}x{height}: {fps:.2f} FPS (за {elapsed:.2f} с)")
 
     picam2.stop()
 
-cv2.destroyAllWindows()
-print("\nТест завершено.")
+    total_time = time.time() - start_time
+    fps = frames / total_time if total_time > 0 else 0.0
+
+    print(
+        f"[RESULT] Resolution {width}x{height} -> "
+        f"time: {total_time:.2f} s, frames: {frames}, FPS: {fps:.2f}"
+    )
+
+    results_summary.append((width, height, total_time, frames, fps))
+
+# ==== PRINT SUMMARY TABLE ====
+print("\n================= SUMMARY =================")
+print("Resolution\t\tTime (s)\tFrames\tFPS")
+for (w, h, t, f, fps) in results_summary:
+    res_str = f"{w}x{h}"
+    # align output a bit
+    if len(res_str) < 8:
+        res_str += "\t"
+    print(f"{res_str}\t{t:.2f}\t\t{f}\t{fps:.2f}")
+
+print("===========================================")
+print("[INFO] Benchmark finished.")
